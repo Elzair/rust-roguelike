@@ -27,6 +27,10 @@ const LIMIT_FPS: i32 = 20; // 20 frames-per-second maximum
 const PLAYER: usize = 0; // Player will always be the first object
 
 const HEAL_AMOUNT: i32 = 4;
+const LIGHTNING_DAMAGE: i32 = 40;
+const LIGHTNING_RANGE: i32 = 5;
+const CONFUSE_RANGE: i32 = 8;
+const CONFUSE_NUM_TURNS: i32 = 10;
 
 /// This is a generic object: the player, a monster, an item, the stairs...
 /// It is always represented by a character on screen.
@@ -185,6 +189,20 @@ impl Object {
     }
 
     pub fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &mut Game, objects: &mut [Object]) {
+        use Ai::*;
+        if let Some(ai) = objects[monster_id].ai.take() {
+            let new_ai = match ai {
+                Basic => Object::ai_basic(monster_id, tcod, game, objects),
+                Confused {
+                    previous_ai,
+                    num_turns,
+                } => Object::ai_confused(monster_id, tcod, game, objects, previous_ai, num_turns),
+            };
+            objects[monster_id].ai = Some(new_ai);
+        }
+    }
+
+    pub fn ai_basic(monster_id: usize, tcod: &Tcod, game: &mut Game, objects: &mut [Object]) -> Ai {
         // A basic monster takes its turn. If you can see it, it can see you.
         let (monster_x, monster_y) = objects[monster_id].pos();
         if tcod.fov.is_in_fov(monster_x, monster_y) {
@@ -197,6 +215,40 @@ impl Object {
                 let (monster, player) = mut_two(monster_id, PLAYER, objects);
                 monster.attack(player, game);
             }
+        }
+        Ai::Basic
+    }
+
+    pub fn ai_confused(
+        monster_id: usize,
+        _tcod: &Tcod,
+        game: &mut Game,
+        objects: &mut [Object],
+        previous_ai: Box<Ai>,
+        num_turns: i32,
+    ) -> Ai
+    {
+        if num_turns >= 0 {
+            // Monster is still confused.
+            // Move in a random direction, and decrease the number of turns confused. 
+            Object::move_by(
+                monster_id, 
+                rand::thread_rng().gen_range(-1, 2), 
+                rand::thread_rng().gen_range(-1, 2), 
+                &game.map, 
+                objects
+            );
+            Ai::Confused {
+                previous_ai: previous_ai,
+                num_turns: num_turns - 1,
+            }
+        } else {
+            // Restore the previous AI (this one will be deleted)
+            game.messages.add(
+                format!("The {} is no longer confused!", objects[monster_id].name),
+                RED
+            );
+            *previous_ai
         }
     }
 
@@ -217,7 +269,31 @@ impl Object {
             game.inventory.push(item);
         }
     }
+
+    /// Find closest enemy, up to a maximum range, and in the player's FOV. 
+    fn closest_monster(tcod: &Tcod, objects: &[Object], max_range: i32) -> Option<usize> {
+        let mut closest_enemy = None;
+        let mut closest_dist = (max_range + 1) as f32; // Start with (slightly more than) maximum range. 
+
+        for (id, object) in objects.iter().enumerate() {
+            if (id != PLAYER)
+                && object.fighter.is_some()
+                && object.ai.is_some()
+                && tcod.fov.is_in_fov(object.x, object.y)
+            {
+                // Calculate distance between this object and the player. 
+                let dist = objects[PLAYER].distance_to(object);
+                if dist < closest_dist {
+                    // It is closer, so remember it. 
+                    closest_enemy = Some(id);
+                    closest_dist = dist;
+                }
+            }
+        }
+        closest_enemy
+    }
 }
+
 
 /// Combat-related component
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,6 +309,10 @@ struct Fighter {
 #[derive(Clone, Debug, PartialEq)]
 enum Ai {
     Basic,
+    Confused {
+        previous_ai: Box<Ai>,
+        num_turns: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -276,6 +356,8 @@ fn monster_death(monster: &mut Object, game: &mut Game) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Item {
     Heal,
+    Lightning,
+    Confuse,
 }
 
 enum UseResult {
@@ -304,12 +386,76 @@ fn cast_heal(
     UseResult::Cancelled
 }
 
+fn cast_lightning(
+    _inventory_id: usize,
+    tcod: &mut Tcod,
+    game: &mut Game,
+    objects: &mut [Object],
+) -> UseResult 
+{
+    // Find the closest enemy (inside a maximum range and damage it)
+    let monster_id = Object::closest_monster(tcod, objects, LIGHTNING_RANGE);
+    if let Some(monster_id) = monster_id {
+        // Zap it! 
+        game.messages.add(
+            format!(
+                "A lightning bolt strikes the {} with a loud thunder! \
+                The damage is {} hit points.",
+                objects[monster_id].name, LIGHTNING_DAMAGE
+            ),
+            LIGHT_BLUE
+        );
+        objects[monster_id].take_damage(LIGHTNING_DAMAGE, game);
+        UseResult::UsedUp
+    } else {
+        // NO enemy found within maximum range. 
+        game.messages
+            .add("No enemy is close enough to strike.", RED);
+        UseResult::Cancelled
+    }
+}
+
+fn cast_confuse(
+    _inventory_id: usize,
+    tcod: &mut Tcod,
+    game: &mut Game,
+    objects: &mut [Object],
+) -> UseResult 
+{
+    // Find closest enemy in range and confuse it. 
+    let monster_id = Object::closest_monster(tcod, objects, CONFUSE_RANGE);
+    if let Some(monster_id) = monster_id {
+        let old_ai = objects[monster_id].ai.take().unwrap_or(Ai::Basic);
+        // Replace the monster's AI with a "confused" one; after
+        // some turns it will restore the old AI
+        objects[monster_id].ai = Some(Ai::Confused) {
+            previous_ai: Box::new(old_ai),
+            num_turns: CONFUSE_NUM_TURNS,
+        };
+        game.messages.add(
+            format!(
+                "The eyes of {} look vacant, as he starts to stumble around!",
+                objects[monster_id].name
+            ),
+            LIGHT_GREEN
+        );
+        UseResult::UsedUp
+    } else {
+        // No enemy found within maximum range. 
+        game.messages
+            .add("No enemy is close enough to strike.", RED);
+        UseResult::Cancelled
+    }
+}
+
 fn use_item(inventory_id: usize, tcod: &mut Tcod, game: &mut Game, objects: &mut [Object]) {
     use Item::*;
     // Just call the "use_function" if it is defined. 
     if let Some(item) = game.inventory[inventory_id].item {
         let on_use = match item {
             Heal => cast_heal,
+            Lightning => cast_lightning,
+            Confuse => cast_confuse,
         };
         match on_use(inventory_id, tcod, game, objects) {
             UseResult::UsedUp => {
@@ -488,10 +634,45 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
 
         // Only place item if the tile is not blocked. 
         if !Object::is_blocked(x, y, map, objects) {
-            // Create a healing potion. 
-            let mut object = Object::new(x, y, '!', "healing potion", VIOLET, false);
-            object.item = Some(Item::Heal);
-            objects.push(object);
+            let dice = rand::random::<f32>();
+            let item = if dice < 0.7 {
+                // Create a healing potion. (70% chance)
+                let mut object = Object::new(
+                    x, 
+                    y, 
+                    '!', 
+                    "healing potion", 
+                    VIOLET, 
+                    false
+                );
+                object.item = Some(Item::Heal);
+                object
+            } else if dice < 0.7 + 0.1 {
+                // Create a lightning bolt scroll (10% chance)
+                let mut object = Object::new(
+                    x,
+                    y,
+                    '#',
+                    "scroll of lightning bolt",
+                    LIGHT_YELLOW,
+                    false,
+                );
+                object.item = Some(Item::Lightning);
+                object
+            } else {
+                // Create a confuse scroll (20% chance)
+                let mut object = Object::new(
+                    x,
+                    y,
+                    '#',
+                    "scroll of confusion",
+                    LIGHT_YELLOW,
+                    false
+                );
+                object.item = Some(Item::Confuse);
+                object
+            };
+            objects.push(item);
         }
     }
 }
